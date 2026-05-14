@@ -10,6 +10,7 @@
 !dags/sftp_template_dag.py
 !dags/api_template_dag.py
 !dags/mongo_template_dag.py
+!dags/Weather_API_DAG.py
 /config/*
 /archive/*
 !dags/libs/openmeteopy/
