@@ -48,7 +48,7 @@ log = logging.getLogger(__name__)
 # -- DAG Configuration
 STAGING_AREA = Path("staging/api")
 PROCESSED_LOG_FILE = STAGING_AREA / "processed_dates.txt"
-SNOWFLAKE_TABLE = "YOUR_WEATHER_TABLE_NAME_HERE"  # TODO: Replace with your target table name
+SNOWFLAKE_TABLE = "WEATHER_API_LOWRY_R"  # TODO: Replace with your target table name
 
 # A dictionary of cities and their coordinates for the API call
 CITIES = {
@@ -119,7 +119,7 @@ def api_template_pipeline():
                 # TODO: Add more daily variables here!
                 # Refer to the `openmeteopy.daily.DailyHistorical` class for available options.
                 # Example: .weather_code().sunrise().sunset()
-                daily = DailyHistorical().temperature_2m_max().temperature_2m_min().precipitation_sum().windspeed_10m_max()
+                daily = DailyHistorical().temperature_2m_max().temperature_2m_min().precipitation_sum().windspeed_10m_max().precipitation_hours().winddirection_10m_dominant().sunrise().sunset().apparent_temperature_max().apparent_temperature_min()
 
                 mgr = OpenMeteo(options, daily=daily.all())
                 response = mgr.get_dict()
@@ -161,8 +161,13 @@ def api_template_pipeline():
 
         # TODO: Add your data transformation logic here.
         # For example, you could add a unique ID, convert units, or derive new columns.
-        # df['temp_range_c'] = df['max_temp'] - df['min_temp']
-        # df['load_ts'] = datetime.utcnow()
+        df['weather_date'] = pd.to_datetime(df['weather_date'])
+        df['temp_range_c'] = df['max_temp'] - df['min_temp']
+        df['ave_precip_per_hour'] = df['precip'] / df['precip_hours'].replace(0, pd.NA)
+        df['sunrise'] = pd.to_datetime(df['sunrise'])
+        df['sunset'] = pd.to_datetime(df['sunset'])
+        df['sunlight_hours'] = (df['sunset'] - df['sunrise']).dt.total_seconds() / 3600
+        df.columns = [col.upper() for col in df.columns]  # Snowflake convention is uppercase column names
         
         log.info(f"Transformation complete. DataFrame has {len(df)} rows.")
         return df, date_str
@@ -177,17 +182,42 @@ def api_template_pipeline():
         if df is None or df.empty:
             log.info("No data to load. Skipping Snowflake and logging steps.")
             return date_str
+        log.info(f"Contents of DataFrame to be loaded:\n{df.head()}")
+        # log.info("CAN YOU SEE ME!?")  # Debugging line to confirm task execution in Airflow logs.
 
         log.info(f"Loading {len(df)} rows into Snowflake table: {SNOWFLAKE_TABLE}")
-        # conn = get_snowflake_connection() # TODO: Uncomment when ready
+        conn = get_snowflake_connection() # TODO: Uncomment when ready
         try:
             # TODO: Use conn.cursor() to execute a MERGE statement or `write_pandas`.
             # A MERGE statement is recommended for idempotency.
             # Example:
+            from snowflake.connector.pandas_tools import write_pandas
+            success, _, _, _ = write_pandas(conn, df, SNOWFLAKE_TABLE, auto_create_table=True, overwrite=False)
+            if not success:
+                raise Exception("Failed to write to Snowflake.")
+
+            # cursor = conn.cursor()
+
+            # # Create a temporary staging table in Snowflake for the MERGE operation.
+            # cursor.execute(f"CREATE TEMORARY TABLE {SNOWFLAKE_TABLE}_STAGING LIKE {SNOWFLAKE_TABLE}")
+
+            # # Use write_pandas to load the DataFrame into the staging table.
             # from snowflake.connector.pandas_tools import write_pandas
-            # success, _, _, _ = write_pandas(conn, df, SNOWFLAKE_TABLE, auto_create_table=True, overwrite=False)
+            # success, _, _, _ = write_pandas(conn, df, f"{SNOWFLAKE_TABLE}_STAGING", auto_create_table=False, overwrite=True)
             # if not success:
-            #     raise Exception("Failed to write to Snowflake.")
+            #     raise Exception("Failed to write to Snowflake staging table.")
+            
+            # # Build and execute the MERGE statement to upsert data from the staging table to the target table.
+            # cursor.execute(f"""
+            #     MERGE INTO {SNOWFLAKE_TABLE} t
+            #     USING {SNOWFLAKE_TABLE}_STAGING s
+            #     ON t.WEATHER_DATE = s.WEATHER_DATE AND t.CITY = s.CITY
+            #     WHEN MATCHED THEN
+            #         UPDATE SET t.MAX_TEMP = s.MAX_TEMP, t.MIN_TEMP = s.MIN_TEMP, t.PRECIP = s.PRECIP, t.MAX_WIND = s.MAX_WIND, t.TEMP_RANGE_C = s.TEMP_RANGE_C, t.AVE_PRECIP_PER_HOUR = s.AVE_PRECIP_PER_HOUR, t.SUNRISE = s.SUNRISE, t.SUNSET = s.SUNSET, t.SUNLIGHT_HOURS = s.SUNLIGHT_HOURS
+            #     WHEN NOT MATCHED THEN
+            #         INSERT (WEATHER_DATE, CITY, MAX_TEMP, MIN_TEMP, PRECIP, MAX_WIND, TEMP_RANGE_C, AVE_PRECIP_PER_HOUR, SUNRISE, SUNSET, SUNLIGHT_HOURS)
+            #         VALUES (s.WEATHER_DATE, s.CITY, s.MAX_TEMP, s.MIN_TEMP, s.PRECIP, s.MAX_WIND, s.TEMP_RANGE_C, s.AVE_PRECIP_PER_HOUR, s.SUNRISE, s.SUNSET, s.SUNLIGHT_HOURS)
+            # """)
             
             # --- Log Processed Date on Success ---
             with open(PROCESSED_LOG_FILE, "a") as f:
@@ -198,7 +228,7 @@ def api_template_pipeline():
             log.error(f"Snowflake load failed: {e}")
             raise
         finally:
-            # if conn: conn.close() # TODO: Uncomment when ready
+            if conn: conn.close() # TODO: Uncomment when ready
             log.info("Snowflake connection placeholder closed.")
             
         return date_str
